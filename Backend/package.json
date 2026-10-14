@@ -11,7 +11,8 @@
     "start": "nodemon server.js",
     "dev": "nodemon server.js",
     "migrate:username-index": "node scripts/ensureGlobalUsernameIndex.js",
-    "migrate:shared-exams": "node scripts/migrateSharedExaminations.js"
+    "migrate:shared-exams": "node scripts/migrateSharedExaminations.js",
+    "setup:first-super-admin": "node scripts/createFirstSuperAdmin.js"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
