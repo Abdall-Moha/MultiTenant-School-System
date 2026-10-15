@@ -13,7 +13,7 @@
   display: grid;
   place-items: center;
   padding: 24px;
-  background: #f5f7fb;
+  background: darkblue;
 }
 .login-brand {
   margin-bottom: 36px;
