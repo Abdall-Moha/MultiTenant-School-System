@@ -16,7 +16,6 @@ import {
 } from "react-icons/fi";
 import { useAuth } from "../hooks/useAuth.js";
 import api, { getAssetUrl } from "../services/api.js";
-
 const navigation = [
   {
     label: "Dashboard",
@@ -146,9 +145,10 @@ const navigation = [
     items: [{ label: "Settings", path: "/settings", icon: FiSettings }],
   },
 ];
-
 function Sidebar({ open, onClose, schoolName, schoolLogo }) {
   const { user, logout } = useAuth();
+  const role = String(user?.role || "").trim().toUpperCase();
+  const isSuperAdmin = role === "SUPER_ADMIN";
   return (
     <>
       {open && (
@@ -161,7 +161,13 @@ function Sidebar({ open, onClose, schoolName, schoolLogo }) {
       )}
       <aside className={`sidebar ${open ? "sidebar-open" : ""}`}>
         <div className="sidebar-brand">
-          <SchoolLogoMark logo={schoolLogo} schoolName={schoolName} />
+          <span className="brand-mark">
+            {isSuperAdmin ? (
+              <img src="/Schomas%20Logo.png" alt="Schomas Logo" />
+            ) : (
+              <SchoolLogoMark logo={schoolLogo} schoolName={schoolName} />
+            )}
+          </span>
           <span>
             {schoolName || (
               <>
@@ -180,29 +186,41 @@ function Sidebar({ open, onClose, schoolName, schoolLogo }) {
         </div>
         <div className="sidebar-school">
           <span className="school-avatar">
-            <FiBookOpen />
+            {isSuperAdmin ? (
+              <img
+                className="school-avatar-image"
+                src="/Schomas%20Logo.png"
+                alt="Schomas Logo"
+              />
+            ) : (
+              <SchoolLogoMark
+                logo={schoolLogo}
+                schoolName={schoolName}
+                className="school-avatar-image"
+              />
+            )}
           </span>
           <span>
             <strong>
-              {user?.role === "SUPER_ADMIN" ? "Platform" : "School workspace"}
+              {role === "SUPER_ADMIN" ? "Platform" : "School workspace"}
             </strong>
             <small>
-              {user?.role === "SUPER_ADMIN"
+              {role === "SUPER_ADMIN"
                 ? "Super administrator"
-                : user?.role?.toLowerCase()}
+                : role.toLowerCase()}
             </small>
           </span>
         </div>
         <nav className="sidebar-navigation" aria-label="Main navigation">
           {navigation
-            .filter((group) => group.roles.includes(user?.role))
+            .filter((group) => group.roles.includes(role))
             .map((group) =>
               group.items ? (
                 <div className="nav-group" key={group.section}>
                   <div className="nav-section-title">{group.section}</div>
                   {group.items
                     .filter(
-                      (item) => !item.roles || item.roles.includes(user?.role),
+                      (item) => !item.roles || item.roles.includes(role),
                     )
                     .map((item) => (
                       <NavLink
@@ -216,7 +234,7 @@ function Sidebar({ open, onClose, schoolName, schoolLogo }) {
                         <item.icon />
                         <span>
                           {item.path === "/schools" &&
-                          user?.role === "SUPER_ADMIN"
+                          role === "SUPER_ADMIN"
                             ? "Schools"
                             : item.label}
                         </span>
@@ -254,18 +272,23 @@ function Sidebar({ open, onClose, schoolName, schoolLogo }) {
     </>
   );
 }
-
-function SchoolLogoMark({ logo, schoolName }) {
-  const [failedLogo, setFailedLogo] = useState("");
+function SchoolLogoMark({ logo, schoolName, className }) {
+  const [failedLogoUrl, setFailedLogoUrl] = useState("");
+  const schomasLogoUrl = "/Schomas%20Logo.png";
   const logoUrl = logo ? getAssetUrl(logo) : "";
+  const schoolLogoFailed = Boolean(logoUrl && failedLogoUrl === logoUrl);
+  const imageUrl = logoUrl && !schoolLogoFailed ? logoUrl : schomasLogoUrl;
+  const alt = imageUrl === schomasLogoUrl
+    ? "Schomas Logo"
+    : `${schoolName || "School"} logo`;
+
   return (
-    <span className="brand-mark">
-      {logoUrl && failedLogo !== logoUrl ? (
-        <img src={logoUrl} alt={`${schoolName || "School"} logo`} onError={() => setFailedLogo(logoUrl)} />
-      ) : (
-        <FiBookOpen />
-      )}
-    </span>
+    <img
+      className={className}
+      src={imageUrl}
+      alt={alt}
+      onError={() => setFailedLogoUrl(imageUrl)}
+    />
   );
 }
 
@@ -277,6 +300,7 @@ export default function MainLayout() {
     logo: "",
   });
   const { user } = useAuth();
+  const role = String(user?.role || "").trim().toUpperCase();
   const location = useLocation();
   const titles = {
     "/dashboard": "Dashboard",
@@ -307,15 +331,12 @@ export default function MainLayout() {
       ? location.pathname.endsWith("/edit")
         ? "Edit Plan"
         : "Plan Details"
-      : location.pathname === "/schools" && user?.role !== "SUPER_ADMIN"
+      : location.pathname === "/schools" && role !== "SUPER_ADMIN"
       ? "School"
       : titles[location.pathname] || "Dashboard";
-
   useEffect(() => {
-    const role = user?.role;
     const schoolId = user?.schoolId;
     if (!role || role === "SUPER_ADMIN" || !schoolId) return undefined;
-
     let isCurrent = true;
     const loadSchoolBranding = () => {
       api
@@ -335,13 +356,11 @@ export default function MainLayout() {
     };
     loadSchoolBranding();
     window.addEventListener("school-branding-updated", loadSchoolBranding);
-
     return () => {
       isCurrent = false;
       window.removeEventListener("school-branding-updated", loadSchoolBranding);
     };
-  }, [user?.role, user?.schoolId]);
-
+  }, [role, user?.schoolId]);
   const schoolName =
     schoolBranding.schoolId === String(user?.schoolId)
       ? schoolBranding.schoolName
@@ -350,14 +369,13 @@ export default function MainLayout() {
     schoolBranding.schoolId === String(user?.schoolId)
       ? schoolBranding.logo
       : "";
-
   return (
     <div className="app-shell">
       <Sidebar
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
-        schoolName={user?.role === "SUPER_ADMIN" ? "" : schoolName}
-        schoolLogo={user?.role === "SUPER_ADMIN" ? "" : schoolLogo}
+        schoolName={role === "SUPER_ADMIN" ? "" : schoolName}
+        schoolLogo={role === "SUPER_ADMIN" ? "" : schoolLogo}
       />
       <div className="app-main">
         <header className="topbar">
