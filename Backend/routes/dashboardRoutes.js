@@ -7,6 +7,7 @@ import AcademicYear from "../models/AcademicYear.js";
 import Attendance from "../models/Attendence.js";
 import Class from "../models/Class.js";
 import Event from "../models/Event.js";
+import Fee from "../models/Fee.js";
 import Mark from "../models/Mark.js";
 import Parent from "../models/Parent.js";
 import School from "../models/School.js";
@@ -15,6 +16,7 @@ import Student from "../models/Student.js";
 import StudentEnrollment from "../models/StudentEnrollment.js";
 import Subject from "../models/Subject.js";
 import SubjectExam from "../models/SubjectExam.js";
+import Subscription from "../models/Subscription.js";
 import Teacher from "../models/Teacher.js";
 import TeacherAssignment from "../models/TeacherAssignment.js";
 import User from "../models/User.js";
@@ -22,6 +24,96 @@ import User from "../models/User.js";
 const router = express.Router();
 
 const recentListLimit = 5;
+
+function useFallback(promise, fallbackValue) {
+  return promise.catch(() => fallbackValue);
+}
+
+function getSixMonthWindow() {
+  const now = new Date();
+  const firstMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 5, 1));
+  const months = [];
+
+  for (let offset = 0; offset < 6; offset += 1) {
+    const date = new Date(Date.UTC(firstMonth.getUTCFullYear(), firstMonth.getUTCMonth() + offset, 1));
+    months.push({
+      key: `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`,
+      label: date.toLocaleString("en-US", { month: "short", timeZone: "UTC" }),
+    });
+  }
+
+  return { startDate: firstMonth, months };
+}
+
+function fillMonthlyValues(rows, keys) {
+  const valuesByMonth = new Map(
+    rows.map((row) => [
+      `${row._id.year}-${String(row._id.month).padStart(2, "0")}`,
+      row,
+    ]),
+  );
+
+  return keys.map((month) => ({
+    label: month.label,
+    ...(valuesByMonth.get(month.key) || {}),
+  }));
+}
+
+async function getMonthlyCounts(Model, filter = {}) {
+  const { startDate, months } = getSixMonthWindow();
+  const rows = await Model.aggregate([
+    { $match: { ...filter, createdAt: { $gte: startDate } } },
+    {
+      $group: {
+        _id: {
+          year: { $year: "$createdAt" },
+          month: { $month: "$createdAt" },
+        },
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { "_id.year": 1, "_id.month": 1 } },
+  ]);
+
+  return fillMonthlyValues(rows, months).map((month) => ({
+    label: month.label,
+    count: month.count || 0,
+  }));
+}
+
+async function getMonthlyAttendance(schoolId, academicYearId) {
+  const { startDate, months } = getSixMonthWindow();
+  const rows = await Attendance.aggregate([
+    {
+      $match: {
+        schoolId: new mongoose.Types.ObjectId(schoolId),
+        academicYearId,
+        date: { $gte: startDate },
+      },
+    },
+    {
+      $group: {
+        _id: {
+          year: { $year: "$date" },
+          month: { $month: "$date" },
+        },
+        present: { $sum: { $cond: [{ $eq: ["$status", "PRESENT"] }, 1, 0] } },
+        absent: { $sum: { $cond: [{ $eq: ["$status", "ABSENT"] }, 1, 0] } },
+        late: { $sum: { $cond: [{ $eq: ["$status", "LATE"] }, 1, 0] } },
+        excused: { $sum: { $cond: [{ $eq: ["$status", "EXCUSED"] }, 1, 0] } },
+      },
+    },
+    { $sort: { "_id.year": 1, "_id.month": 1 } },
+  ]);
+
+  return fillMonthlyValues(rows, months).map((month) => ({
+    label: month.label,
+    present: month.present || 0,
+    absent: month.absent || 0,
+    late: month.late || 0,
+    excused: month.excused || 0,
+  }));
+}
 
 async function getUpcomingEvents(schoolId) {
   return Event.find({ schoolId, eventDate: { $gte: new Date() } })
@@ -60,6 +152,34 @@ async function getAttendanceSummary(filter) {
     excused: totals?.excused || 0,
     // The percentage uses recorded entries only. Missing attendance is not counted as absence.
     presentPercentage: recorded ? Number(((totals.present / recorded) * 100).toFixed(1)) : null,
+  };
+}
+
+async function getStudentFeeSummary(studentId, schoolId) {
+  const [totals] = await Fee.aggregate([
+    {
+      $match: {
+        schoolId: new mongoose.Types.ObjectId(schoolId),
+        studentId,
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        billed: { $sum: "$amount" },
+        paid: { $sum: "$paidAmount" },
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+
+  const billed = totals?.billed || 0;
+  const paid = totals?.paid || 0;
+  return {
+    billed,
+    paid,
+    outstanding: Math.max(0, billed - paid),
+    feeCount: totals?.count || 0,
   };
 }
 
@@ -159,18 +279,55 @@ router.get(
     try {
       // Platform statistics are intentionally separate from school-level data.
       if (req.user.role === "SUPER_ADMIN") {
-        const [totalSchools, activeSchools, suspendedSchools, userIds, adminIds, recentSchools] =
+        const [
+          totalSchools,
+          activeSchools,
+          suspendedSchools,
+          totalUsers,
+          totalStudents,
+          totalTeachers,
+          totalAdmins,
+          activeSubscriptions,
+          subscriptionPayments,
+          schoolRegistrationTrend,
+          subscriptionPlanDistribution,
+          recentSchools,
+          recentSubscriptions,
+        ] =
           await Promise.all([
             School.countDocuments({}),
             School.countDocuments({ status: "ACTIVE" }),
             School.countDocuments({ status: "SUSPENDED" }),
-            User.distinct("_id"),
-            User.distinct("_id", { role: "ADMIN" }),
+            User.countDocuments({}),
+            Student.countDocuments({}),
+            Teacher.countDocuments({}),
+            User.countDocuments({ role: "ADMIN" }),
+            useFallback(Subscription.countDocuments({ status: "ACTIVE" }), null),
+            useFallback(Subscription.aggregate([
+              { $group: { _id: null, amount: { $sum: "$amountPaid" } } },
+            ]), null),
+            useFallback(getMonthlyCounts(School), null),
+            useFallback(Subscription.aggregate([
+              {
+                $group: {
+                  _id: "$planName",
+                  count: { $sum: 1 },
+                  active: { $sum: { $cond: [{ $eq: ["$status", "ACTIVE"] }, 1, 0] } },
+                },
+              },
+              { $sort: { count: -1, _id: 1 } },
+            ]), null),
             School.find({})
               .select("schoolName schoolId status createdAt")
               .sort({ createdAt: -1 })
               .limit(recentListLimit)
               .lean(),
+            useFallback(Subscription.find({})
+              .populate("schoolId", "schoolName schoolId")
+              .select("schoolId planName status amountPaid paymentStatus updatedAt")
+              .sort({ updatedAt: -1 })
+              .limit(recentListLimit)
+              .lean(), null),
           ]);
 
         return res.json({
@@ -179,10 +336,26 @@ router.get(
             { label: "Registered Schools", value: totalSchools },
             { label: "Active Schools", value: activeSchools },
             { label: "Suspended Schools", value: suspendedSchools },
-            { label: "Registered Users", value: userIds.length },
-            { label: "School Administrators", value: adminIds.length },
+            { label: "Registered Users", value: totalUsers },
+            { label: "Total Students", value: totalStudents },
+            { label: "Teachers", value: totalTeachers },
+            { label: "School Administrators", value: totalAdmins },
+            { label: "Active Subscriptions", value: activeSubscriptions },
+            {
+              label: "Subscription Payments",
+              value: Number((subscriptionPayments[0]?.amount || 0).toFixed(2)),
+              format: "currency",
+            },
           ],
+          schoolStatusDistribution: { active: activeSchools, suspended: suspendedSchools },
+          schoolRegistrationTrend,
+          subscriptionPlanDistribution: subscriptionPlanDistribution?.map((plan) => ({
+            name: plan._id || "Unnamed plan",
+            count: plan.count,
+            active: plan.active,
+          })) || null,
           recentSchools,
+          recentSubscriptions,
         });
       }
 
@@ -209,6 +382,10 @@ router.get(
           classRecords,
           classEnrollmentTotals,
           attendance,
+          studentEnrollmentTrend,
+          attendanceTrend,
+          feeTotals,
+          recentEnrollments,
           upcomingExams,
         ] = await Promise.all([
           Student.countDocuments({ schoolId }),
@@ -249,6 +426,35 @@ router.get(
           academicYear
             ? getAttendanceSummary({ schoolId, academicYearId: academicYear._id })
             : Promise.resolve({ recorded: 0, present: 0, absent: 0, late: 0, excused: 0, presentPercentage: null }),
+          academicYear
+            ? useFallback(getMonthlyCounts(StudentEnrollment, {
+                schoolId: new mongoose.Types.ObjectId(schoolId),
+                academicYearId: academicYear._id,
+              }), null)
+            : Promise.resolve([]),
+          academicYear
+            ? useFallback(getMonthlyAttendance(schoolId, academicYear._id), null)
+            : Promise.resolve([]),
+          useFallback(Fee.aggregate([
+            { $match: { schoolId: new mongoose.Types.ObjectId(schoolId) } },
+            {
+              $group: {
+                _id: null,
+                billed: { $sum: "$amount" },
+                paid: { $sum: "$paidAmount" },
+                count: { $sum: 1 },
+              },
+            },
+          ]), null),
+          academicYear
+            ? useFallback(StudentEnrollment.find({ schoolId, academicYearId: academicYear._id })
+                .populate("studentId", "fullName roleNumber")
+                .populate("classId", "name")
+                .select("createdAt studentId classId status")
+                .sort({ createdAt: -1 })
+                .limit(recentListLimit)
+                .lean(), null)
+            : Promise.resolve([]),
           getUpcomingExams(schoolId, yearFilter),
         ]);
 
@@ -277,6 +483,15 @@ router.get(
           ],
           classEnrollment,
           attendance,
+          studentEnrollmentTrend,
+          attendanceTrend,
+          feeSummary: feeTotals ? {
+            billed: feeTotals[0]?.billed || 0,
+            paid: feeTotals[0]?.paid || 0,
+            outstanding: Math.max(0, (feeTotals[0]?.billed || 0) - (feeTotals[0]?.paid || 0)),
+            feeCount: feeTotals[0]?.count || 0,
+          } : null,
+          recentEnrollments,
           upcomingExams,
           upcomingEvents,
         });
@@ -295,10 +510,19 @@ router.get(
               schoolId,
               teacherId: teacher._id,
               academicYearId: academicYear._id,
-            }).select("classId subjectId")
+            })
+              .populate("classId", "name")
+              .populate("subjectId", "name")
+              .select("classId subjectId")
           : [];
-        const classIds = [...new Set(assignments.map((item) => String(item.classId)))];
-        const subjectIds = [...new Set(assignments.map((item) => String(item.subjectId)))];
+        const classIds = [...new Set(assignments.map((item) => String(item.classId?._id)).filter(Boolean))];
+        const subjectIds = [...new Set(assignments.map((item) => String(item.subjectId?._id)).filter(Boolean))];
+        const assignedClasses = [...new Map(assignments
+          .filter((item) => item.classId)
+          .map((item) => [String(item.classId._id), { _id: item.classId._id, name: item.classId.name }])).values()];
+        const assignedSubjects = [...new Map(assignments
+          .filter((item) => item.subjectId)
+          .map((item) => [String(item.subjectId._id), { _id: item.subjectId._id, name: item.subjectId.name }])).values()];
         const activeEnrollmentRecords = classIds.length && academicYear
           ? await StudentEnrollment.find({
               schoolId,
@@ -312,8 +536,8 @@ router.get(
           ? await Student.countDocuments({ _id: { $in: studentIds }, schoolId, status: "ACTIVE" })
           : 0;
         const examConditions = assignments.map((item) => ({
-          classId: item.classId,
-          subjectId: item.subjectId,
+          classId: item.classId?._id,
+          subjectId: item.subjectId?._id,
         }));
         const upcomingExams = academicYear && examConditions.length
           ? await getUpcomingExams(schoolId, {
@@ -322,6 +546,13 @@ router.get(
               $or: examConditions,
             })
           : [];
+        const attendance = academicYear && classIds.length
+          ? await getAttendanceSummary({
+              schoolId,
+              academicYearId: academicYear._id,
+              classId: { $in: classIds.map((id) => new mongoose.Types.ObjectId(id)) },
+            })
+          : { recorded: 0, present: 0, absent: 0, late: 0, excused: 0, presentPercentage: null };
 
         return res.json({
           role: req.user.role,
@@ -331,7 +562,11 @@ router.get(
             { label: "Assigned Classes", value: classIds.length },
             { label: "Assigned Subjects", value: subjectIds.length },
             { label: "Students in Assigned Classes", value: activeStudents },
+            { label: "Attendance rate", value: attendance.recorded ? attendance.presentPercentage : null, suffix: "%" },
           ],
+          assignedClasses,
+          assignedSubjects,
+          attendance,
           upcomingExams,
           upcomingEvents,
         });
@@ -345,12 +580,13 @@ router.get(
 
         const enrollment = await getCurrentEnrollment(student._id, schoolId, academicYear);
         const classId = enrollment?.classId?._id;
-        const [attendance, recentMarks, upcomingExams] = await Promise.all([
+        const [attendance, recentMarks, upcomingExams, feeSummary] = await Promise.all([
           getRecentStudentAttendance(student._id, schoolId, academicYear?._id),
           getRecentStudentMarks(student._id, schoolId, academicYear?._id),
           classId && academicYear
             ? getUpcomingExams(schoolId, { classId, academicYearId: academicYear._id })
             : [],
+          useFallback(getStudentFeeSummary(student._id, schoolId), null),
         ]);
 
         return res.json({
@@ -361,6 +597,7 @@ router.get(
           attendance,
           recentMarks,
           upcomingExams,
+          feeSummary,
           upcomingEvents,
         });
       }
@@ -378,12 +615,13 @@ router.get(
       const childrenWithDetails = await Promise.all(children.map(async (child) => {
         const enrollment = await getCurrentEnrollment(child._id, schoolId, academicYear);
         const classId = enrollment?.classId?._id;
-        const [attendance, recentMarks, upcomingExams] = await Promise.all([
+        const [attendance, recentMarks, upcomingExams, feeSummary] = await Promise.all([
           getRecentStudentAttendance(child._id, schoolId, academicYear?._id),
           getRecentStudentMarks(child._id, schoolId, academicYear?._id),
           classId && academicYear
             ? getUpcomingExams(schoolId, { classId, academicYearId: academicYear._id })
             : [],
+          useFallback(getStudentFeeSummary(child._id, schoolId), null),
         ]);
 
         return {
@@ -392,6 +630,7 @@ router.get(
           attendance,
           recentMarks,
           upcomingExams,
+          feeSummary,
         };
       }));
 
